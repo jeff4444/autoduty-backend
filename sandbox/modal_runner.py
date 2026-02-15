@@ -61,7 +61,19 @@ async function runTest() {{
                 process.exit(1);
             }}
         }} else if (typeof POST === 'function') {{
-            const req = new Request('http://localhost/test', {{ method: 'POST' }});
+            // POST routes expect a JSON body — provide a plausible dummy payload
+            const req = new Request('http://localhost/test', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{
+                    email: 'test@example.com',
+                    code: 'SAVE10',
+                    subtotal: 100,
+                    customer: {{ name: 'Test', email: 'test@example.com', address: '123 Main St', city: 'NY', zip: '10001' }},
+                    items: [{{ productId: 1, name: 'Test Item', quantity: 1, price: 49.99 }}],
+                    total: 49.99,
+                }}),
+            }});
             const res = await POST(req);
             console.log('[{label}] Status:', res.status);
             if (res.status >= 500) {{
@@ -85,22 +97,31 @@ def _strip_imports(code: str) -> str:
     """Strip Next.js-specific imports and the withAutoduty wrapper that won't work in sandbox."""
     lines = code.split("\n")
     cleaned = []
+    http_method = "GET"  # default
+
     for line in lines:
         # Skip Next.js and autoduty imports
         if 'from "next/' in line or "from 'next/" in line:
             continue
         if "from \"@/lib/error-reporter\"" in line or "from '@/lib/error-reporter'" in line:
             continue
-        # Skip the export const GET = withAutoduty(...) line
-        if line.strip().startswith("export const GET = withAutoduty") or line.strip().startswith(
-            "export const POST = withAutoduty"
+        # Detect the HTTP method from the withAutoduty export and skip the line
+        stripped = line.strip()
+        if stripped.startswith("export const POST = withAutoduty") or stripped.startswith(
+            "export const POST ="
         ):
+            http_method = "POST"
+            continue
+        if stripped.startswith("export const GET = withAutoduty") or stripped.startswith(
+            "export const GET ="
+        ):
+            http_method = "GET"
             continue
         cleaned.append(line)
 
-    # Make the handler function exported directly
+    # Rename the handler function to match the detected HTTP method
     result = "\n".join(cleaned)
-    result = result.replace("async function handler(", "async function GET(")
+    result = result.replace("async function handler(", f"async function {http_method}(")
     return result
 
 
