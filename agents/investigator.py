@@ -88,11 +88,13 @@ async def investigate_incident(
     # 2. Build the user prompt with error context
     user_prompt = _build_prompt(incident, retry_context=retry_context)
 
-    # 3. Set up agent dependencies
+    # 3. Set up agent dependencies (includes incident for sandbox tool access)
     deps = AgentDeps(
         repo=repo,
         event_bus=event_bus,
         incident_id=incident.id,
+        incident=incident,
+        sandbox_runs_remaining=Config.MAX_SANDBOX_RUNS,
     )
 
     # 4. Run the agent using iter() to walk through each node
@@ -114,10 +116,15 @@ async def investigate_incident(
             incident.affected_file = (
                 output.affected_files[0] if output.affected_files else incident.source_file
             )
+            # Populate sandbox verification fields from agent's own assessment
+            incident.sandbox_reproduced = output.reproduction_confirmed
+            incident.sandbox_fix_verified = output.fix_verified
         else:
             log.warning("Agent run for %s completed without a result", incident.id)
             incident.root_cause = "Investigation completed but no structured result produced"
             incident.fix_description = "Check agent events for details"
+            incident.sandbox_reproduced = False
+            incident.sandbox_fix_verified = False
 
         # 6. Compute diffs from all file edits
         incident.file_edits = repo.get_file_edits()

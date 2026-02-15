@@ -26,3 +26,6 @@ class Config:
 
     # Pipeline retry settings
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+
+    # Sandbox budget — max number of sandbox runs per incident
+    MAX_SANDBOX_RUNS = int(os.getenv("MAX_SANDBOX_RUNS", "5"))

@@ -13,7 +13,6 @@ from agents.investigator import investigate_incident
 from config import Config
 from integrations.github_client import create_fix_pr
 from models.incident import store
-from sandbox.modal_runner import run_sandbox_verification
 from streaming.event_bus import event_bus
 from utils.logger import get_logger
 
@@ -181,177 +180,69 @@ async def stream_incident(incident_id: str):
 # ---------------------------------------------------------------------------
 # Pipeline (runs as async task)
 # ---------------------------------------------------------------------------
-def _format_sandbox_feedback(incident) -> str:
-    """Build a retry context string from the sandbox terminal log and results."""
-    lines = []
-    lines.append(f"### Sandbox Results (attempt failed)")
-    lines.append(f"- Bug reproduced: {incident.sandbox_reproduced}")
-    lines.append(f"- Fix verified: {incident.sandbox_fix_verified}")
-    lines.append("")
-
-    if incident.sandbox_terminal_log:
-        lines.append("### Sandbox Terminal Output")
-        lines.append("```")
-        for entry in incident.sandbox_terminal_log[-100:]:  # Last 100 lines
-            prefix = "[stderr] " if entry.stream == "stderr" else ""
-            lines.append(f"[{entry.label}] {prefix}{entry.data}")
-        lines.append("```")
-
-    if incident.sandbox_output:
-        lines.append("")
-        lines.append("### Raw Output")
-        lines.append("```")
-        lines.append(incident.sandbox_output[:2000])
-        lines.append("```")
-
-    return "\n".join(lines)
-
-
 async def _run_pipeline(incident_id: str):
-    """Full remediation pipeline with retry loop.
+    """Full remediation pipeline — the agent handles reproduction and verification internally.
 
-    Flow: Investigate -> Sandbox -> if failed, feed logs back to agent and retry.
-    Controlled by Config.MAX_RETRIES (from env var MAX_RETRIES, default 3).
+    The agent has access to a `run_sandbox` tool that lets it execute arbitrary
+    TypeScript scripts in an isolated Modal sandbox. It uses this to reproduce
+    the bug, apply fixes, and verify them — all within a single agent run.
     """
     incident = store.get(incident_id)
     if not incident:
         return
 
     model = runtime_settings["ai_model"]
-    max_attempts = Config.MAX_RETRIES
-    repo = None  # Will be set by the first investigate_incident call
-    retry_context = None
+    repo = None
 
-    for attempt in range(1, max_attempts + 1):
-        is_retry = attempt > 1
+    # ---- Investigation (agent explores, reproduces, fixes, and verifies) ----
+    try:
+        incident.update_status("investigating")
+        await event_bus.publish(incident_id, {
+            "type": "status_change",
+            "status": "investigating",
+            "message": f"Starting investigation with {model}...",
+        })
+        log.info("Incident %s — investigating with %s", incident.id, model)
 
-        # ---- Phase 1: Investigation ----
-        try:
-            incident.update_status("investigating")
+        repo = await investigate_incident(
+            incident,
+            event_bus,
+            model=model,
+        )
+
+        # ---- Determine final status based on agent's sandbox results ----
+        if incident.sandbox_fix_verified:
+            incident.update_status("verified")
             await event_bus.publish(incident_id, {
                 "type": "status_change",
-                "status": "investigating",
-                "message": (
-                    f"Retry {attempt}/{max_attempts} — re-investigating with sandbox feedback..."
-                    if is_retry
-                    else f"Starting investigation with {model} (attempt {attempt}/{max_attempts})..."
-                ),
+                "status": "verified",
+                "message": "Fix VERIFIED by agent in sandbox!",
             })
-            log.info(
-                "Incident %s — investigating with %s (attempt %d/%d)",
-                incident.id, model, attempt, max_attempts,
-            )
-
-            repo = await investigate_incident(
-                incident,
-                event_bus,
-                model=model,
-                retry_context=retry_context,
-                repo=repo,
-            )
-
+            log.info("Incident %s — fix VERIFIED in sandbox", incident.id)
+        else:
             incident.update_status("fix_proposed")
             await event_bus.publish(incident_id, {
                 "type": "status_change",
                 "status": "fix_proposed",
-                "message": f"Fix proposed: {incident.fix_description}",
+                "message": f"Fix proposed (unverified): {incident.fix_description}",
             })
-            log.info("Incident %s — fix proposed: %s", incident.id, incident.fix_description)
+            log.info("Incident %s — fix proposed (unverified): %s", incident.id, incident.fix_description)
 
-        except Exception as e:
-            log.error("Incident %s — investigation failed (attempt %d): %s", incident.id, attempt, e)
-            incident.update_status("failed")
-            await event_bus.publish(incident_id, {
-                "type": "status_change",
-                "status": "failed",
-                "message": f"Investigation failed: {e}",
-            })
-            # Clean up repo on fatal failure
-            if repo:
-                repo.cleanup()
-            await event_bus.close_stream(incident_id)
-            return
+    except Exception as e:
+        log.error("Incident %s — investigation failed: %s", incident.id, e)
+        incident.update_status("failed")
+        await event_bus.publish(incident_id, {
+            "type": "status_change",
+            "status": "failed",
+            "message": f"Investigation failed: {e}",
+        })
 
-        # ---- Phase 2: Sandbox verification ----
-        try:
-            incident.update_status("simulating")
-            await event_bus.publish(incident_id, {
-                "type": "status_change",
-                "status": "simulating",
-                "message": f"Running sandbox verification (attempt {attempt}/{max_attempts})...",
-            })
-            log.info("Incident %s — running sandbox verification (attempt %d)", incident.id, attempt)
-
-            result = await run_sandbox_verification(incident, event_bus)
-            incident.sandbox_reproduced = result.get("reproduced", False)
-            incident.sandbox_fix_verified = result.get("fix_verified", False)
-            incident.sandbox_output = result.get("output", "")
-
-            if incident.sandbox_fix_verified:
-                incident.update_status("verified")
-                await event_bus.publish(incident_id, {
-                    "type": "status_change",
-                    "status": "verified",
-                    "message": "Fix VERIFIED in sandbox!",
-                })
-                log.info("Incident %s — fix VERIFIED in sandbox (attempt %d)", incident.id, attempt)
-                break  # Success — exit retry loop
-
-            # Not verified — prepare feedback for the next attempt
-            log.warning(
-                "Incident %s — sandbox verification failed (attempt %d/%d)",
-                incident.id, attempt, max_attempts,
-            )
-
-            if attempt < max_attempts:
-                retry_context = _format_sandbox_feedback(incident)
-                await event_bus.publish(incident_id, {
-                    "type": "status_change",
-                    "status": "investigating",
-                    "message": (
-                        f"Fix did not pass sandbox (attempt {attempt}/{max_attempts}). "
-                        "Feeding logs back to agent for retry..."
-                    ),
-                })
-                # Clear terminal log for next attempt so it's clean
-                incident.sandbox_terminal_log = []
-            else:
-                # Final attempt failed — mark as failed
-                incident.update_status("failed")
-                await event_bus.publish(incident_id, {
-                    "type": "status_change",
-                    "status": "failed",
-                    "message": (
-                        f"Sandbox verification failed after {max_attempts} attempts. "
-                        "Unable to produce a working fix."
-                    ),
-                })
-
-        except Exception as e:
-            log.error("Incident %s — sandbox failed (attempt %d): %s", incident.id, attempt, e)
-            incident.sandbox_output = f"Sandbox error: {e}"
-
-            if attempt < max_attempts:
-                retry_context = f"### Sandbox Error\n\nSandbox crashed: {e}\n\nPlease review your fix and try again."
-                await event_bus.publish(incident_id, {
-                    "type": "status_change",
-                    "status": "investigating",
-                    "message": f"Sandbox error on attempt {attempt}. Retrying...",
-                })
-            else:
-                incident.update_status("failed")
-                await event_bus.publish(incident_id, {
-                    "type": "status_change",
-                    "status": "failed",
-                    "message": f"Sandbox error: {e}. Unable to verify fix.",
-                })
-
-    # Clean up the cloned repo
-    if repo:
-        repo.cleanup()
-
-    # Signal stream completion
-    await event_bus.close_stream(incident_id)
+    finally:
+        # Clean up the cloned repo
+        if repo:
+            repo.cleanup()
+        # Signal stream completion
+        await event_bus.close_stream(incident_id)
 
 
 # ---------------------------------------------------------------------------

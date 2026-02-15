@@ -1,14 +1,17 @@
 """Pydantic AI tool functions for codebase interaction.
 
 These tools give the agent the ability to explore and modify the cloned repository,
-similar to how a developer uses an IDE.
+similar to how a developer uses an IDE.  The `run_sandbox` tool additionally lets
+the agent execute arbitrary TypeScript scripts in an isolated Modal sandbox to
+reproduce bugs and verify fixes.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pydantic_ai import RunContext
 
 from agents.repo_context import RepoContext
+from models.incident import Incident
 from streaming.event_bus import EventBus
 from utils.logger import get_logger
 
@@ -22,6 +25,8 @@ class AgentDeps:
     repo: RepoContext
     event_bus: EventBus
     incident_id: str
+    incident: Incident
+    sandbox_runs_remaining: int = 5
 
 
 # ---------------------------------------------------------------------------
@@ -189,3 +194,84 @@ async def list_directory(ctx: RunContext[AgentDeps], path: str = ".") -> str:
             "result": f"Error: {error_msg}",
         })
         return f"Error listing directory: {error_msg}"
+
+
+# ---------------------------------------------------------------------------
+# Sandbox execution tool
+# ---------------------------------------------------------------------------
+
+async def run_sandbox(ctx: RunContext[AgentDeps], script: str, label: str = "test") -> str:
+    """Run a TypeScript script in an isolated sandbox and return the output.
+
+    The sandbox environment has Node.js 20 and tsx available. Scripts must be
+    fully self-contained — there is no access to the repository filesystem,
+    external APIs, or databases. Use this to reproduce bugs and verify fixes
+    by copy-pasting relevant code into a standalone test script.
+
+    Args:
+        script: The full TypeScript source code to execute via tsx.
+        label: A human-readable label for this run (e.g. "reproduce-bug", "verify-fix").
+
+    Returns:
+        A string containing stdout, stderr, and the exit code from the run.
+    """
+    # Lazy import to avoid circular dependency
+    from sandbox.modal_runner import run_single_sandbox
+
+    deps = ctx.deps
+
+    # Enforce sandbox run budget
+    if deps.sandbox_runs_remaining <= 0:
+        msg = "Sandbox run budget exhausted. You have used all available sandbox runs. Please finalize your fix based on the results you already have."
+        await deps.event_bus.publish(deps.incident_id, {
+            "type": "tool_result",
+            "tool": "run_sandbox",
+            "result": msg,
+        })
+        return msg
+
+    deps.sandbox_runs_remaining -= 1
+
+    await deps.event_bus.publish(deps.incident_id, {
+        "type": "tool_call",
+        "tool": "run_sandbox",
+        "args": {"label": label, "script_length": len(script), "runs_remaining": deps.sandbox_runs_remaining},
+    })
+
+    try:
+        result = await run_single_sandbox(
+            script=script,
+            label=label,
+            incident=deps.incident,
+            event_bus=deps.event_bus,
+        )
+
+        # Format the result as a readable string for the agent
+        output_parts = []
+        output_parts.append(f"=== Sandbox Run: {label} ===")
+        output_parts.append(f"Exit code: {result.exit_code}")
+        if result.stdout:
+            output_parts.append(f"\n--- stdout ---\n{result.stdout.strip()}")
+        if result.stderr:
+            output_parts.append(f"\n--- stderr ---\n{result.stderr.strip()}")
+        output_parts.append(f"\n(Sandbox runs remaining: {deps.sandbox_runs_remaining})")
+
+        output = "\n".join(output_parts)
+
+        await deps.event_bus.publish(deps.incident_id, {
+            "type": "tool_result",
+            "tool": "run_sandbox",
+            "result": output[:1000] + "..." if len(output) > 1000 else output,
+        })
+
+        return output
+
+    except Exception as e:
+        error_msg = str(e)
+        log.error("Sandbox execution failed for %s: %s", deps.incident_id, e)
+        await deps.event_bus.publish(deps.incident_id, {
+            "type": "tool_result",
+            "tool": "run_sandbox",
+            "result": f"Sandbox error: {error_msg}",
+        })
+        return f"Sandbox error: {error_msg}"

@@ -1,10 +1,15 @@
-"""Modal Sandbox runner — reproduces bugs and verifies fixes in isolated containers.
+"""Modal Sandbox runner — executes arbitrary scripts in isolated containers.
+
+The agent calls `run_single_sandbox()` directly via the `run_sandbox` tool,
+giving it full control over what scripts to run, how to reproduce bugs,
+and how to verify fixes.
 
 Streams terminal output line-by-line to the SSE event bus so the frontend
 can render a real-time terminal replay.
 """
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import modal
@@ -33,117 +38,50 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _build_test_script(code: str, label: str) -> str:
-    """Build a self-contained TypeScript test script that exercises a route handler."""
-    return f"""
-// Minimal NextResponse polyfill for sandbox
-class NextResponse extends Response {{
-    static json(data, init) {{
-        return new Response(JSON.stringify(data), {{
-            ...init,
-            headers: {{ 'Content-Type': 'application/json', ...(init?.headers || {{}}) }},
-        }});
-    }}
-}}
-
-// --- Source code under test (with imports replaced) ---
-{code}
-
-// --- Test harness ---
-async function runTest() {{
-    try {{
-        if (typeof GET === 'function') {{
-            const req = new Request('http://localhost/test');
-            const res = await GET(req);
-            console.log('[{label}] Status:', res.status);
-            if (res.status >= 500) {{
-                console.error('[{label}] Server error detected');
-                process.exit(1);
-            }}
-        }} else if (typeof POST === 'function') {{
-            // POST routes expect a JSON body — provide a plausible dummy payload
-            const req = new Request('http://localhost/test', {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'application/json' }},
-                body: JSON.stringify({{
-                    email: 'test@example.com',
-                    code: 'SAVE10',
-                    subtotal: 100,
-                    customer: {{ name: 'Test', email: 'test@example.com', address: '123 Main St', city: 'NY', zip: '10001' }},
-                    items: [{{ productId: 1, name: 'Test Item', quantity: 1, price: 49.99 }}],
-                    total: 49.99,
-                }}),
-            }});
-            const res = await POST(req);
-            console.log('[{label}] Status:', res.status);
-            if (res.status >= 500) {{
-                console.error('[{label}] Server error detected');
-                process.exit(1);
-            }}
-        }} else {{
-            console.log('[{label}] Module loaded successfully');
-        }}
-        console.log('[{label}] PASS');
-    }} catch (err) {{
-        console.error('[{label}] FAIL:', err.message);
-        process.exit(1);
-    }}
-}}
-runTest();
-"""
-
-
-def _strip_imports(code: str) -> str:
-    """Strip Next.js-specific imports and the withAutoduty wrapper that won't work in sandbox."""
-    lines = code.split("\n")
-    cleaned = []
-    http_method = "GET"  # default
-
-    for line in lines:
-        # Skip Next.js and autoduty imports
-        if 'from "next/' in line or "from 'next/" in line:
-            continue
-        if "from \"@/lib/error-reporter\"" in line or "from '@/lib/error-reporter'" in line:
-            continue
-        # Detect the HTTP method from the withAutoduty export and skip the line
-        stripped = line.strip()
-        if stripped.startswith("export const POST = withAutoduty") or stripped.startswith(
-            "export const POST ="
-        ):
-            http_method = "POST"
-            continue
-        if stripped.startswith("export const GET = withAutoduty") or stripped.startswith(
-            "export const GET ="
-        ):
-            http_method = "GET"
-            continue
-        cleaned.append(line)
-
-    # Rename the handler function to match the detected HTTP method
-    result = "\n".join(cleaned)
-    result = result.replace("async function handler(", f"async function {http_method}(")
-    return result
-
-
 def _escape_for_bash(s: str) -> str:
     """Escape a string for embedding inside single quotes in bash."""
     return s.replace("'", "'\\''")
 
 
-async def _run_in_sandbox_streaming(
+# ---------------------------------------------------------------------------
+# Sandbox result
+# ---------------------------------------------------------------------------
+@dataclass
+class SandboxResult:
+    """Structured result from a single sandbox execution."""
+
+    stdout: str
+    stderr: str
+    exit_code: int
+    label: str
+
+
+# ---------------------------------------------------------------------------
+# Core sandbox execution
+# ---------------------------------------------------------------------------
+async def run_single_sandbox(
     script: str,
     label: str,
     incident: Incident,
     event_bus: EventBus,
-) -> bool:
+) -> SandboxResult:
     """Run a TypeScript script in a Modal Sandbox, streaming output line-by-line.
 
-    Returns True if the script exits with code 0.
+    This is the single entry point used by the agent's `run_sandbox` tool.
+
+    Args:
+        script: The full TypeScript source code to execute.
+        label: Human-readable label for this run (e.g. "reproduce-bug", "verify-fix").
+        incident: The incident to append terminal log entries to.
+        event_bus: Event bus for streaming SSE events to the frontend.
+
+    Returns:
+        SandboxResult with stdout, stderr, and exit_code.
     """
     await event_bus.publish(incident.id, {
-        "type": "sandbox_status",
-        "label": label,
-        "message": f"Starting sandbox: {label}...",
+        "type": "sandbox_phase",
+        "phase": label,
+        "message": f"Running sandbox: {label}...",
     })
 
     # Run in a thread since Modal's sandbox API is synchronous
@@ -215,102 +153,9 @@ async def _run_in_sandbox_streaming(
         "exit_code": exit_code,
     })
 
-    return exit_code == 0
-
-
-async def run_sandbox_verification(
-    incident: Incident,
-    event_bus: EventBus,
-) -> dict:
-    """Run the buggy code and the fixed code inside a Modal sandbox.
-
-    Streams terminal output to the event bus in real-time.
-
-    Returns:
-        dict with keys: reproduced (bool), fix_verified (bool), output (str)
-    """
-    # Determine source: use the first file edit or fall back to original/fixed code
-    original_code = incident.original_code or ""
-    fixed_code = incident.fixed_code or ""
-
-    # If we have file_edits, use the first one as the primary code to test
-    if incident.file_edits:
-        primary_edit = incident.file_edits[0]
-        original_code = primary_edit.original_content
-        fixed_code = primary_edit.new_content
-
-    if not original_code or not fixed_code:
-        log.warning("Incident %s missing source/fix code, skipping sandbox", incident.id)
-        await event_bus.publish(incident.id, {
-            "type": "sandbox_status",
-            "label": "skip",
-            "message": "Skipped: missing original or fixed code",
-        })
-        return {
-            "reproduced": False,
-            "fix_verified": False,
-            "output": "Skipped: missing original or fixed code",
-        }
-
-    log.info("Starting sandbox verification for incident %s", incident.id)
-
-    try:
-        # Strip Next.js imports that won't resolve in sandbox
-        original_clean = _strip_imports(original_code)
-        fixed_clean = _strip_imports(fixed_code)
-
-        # Step 1: Test original (buggy) code — should FAIL
-        await event_bus.publish(incident.id, {
-            "type": "sandbox_phase",
-            "phase": "reproduce",
-            "message": "Running original (buggy) code — expecting failure...",
-        })
-        original_script = _build_test_script(original_clean, "ORIGINAL-BUGGY")
-        original_passed = await _run_in_sandbox_streaming(
-            original_script, "ORIGINAL-BUGGY", incident, event_bus
-        )
-
-        # Step 2: Test fixed code — should PASS
-        await event_bus.publish(incident.id, {
-            "type": "sandbox_phase",
-            "phase": "verify",
-            "message": "Running fixed code — expecting success...",
-        })
-        fixed_script = _build_test_script(fixed_clean, "FIXED")
-        fix_passed = await _run_in_sandbox_streaming(
-            fixed_script, "FIXED", incident, event_bus
-        )
-
-        result = {
-            "reproduced": not original_passed,
-            "fix_verified": fix_passed,
-            "output": "\n".join(
-                f"[{e.label}] [{e.stream}] {e.data}" for e in incident.sandbox_terminal_log
-            ),
-        }
-
-        await event_bus.publish(incident.id, {
-            "type": "sandbox_complete",
-            "reproduced": result["reproduced"],
-            "fix_verified": result["fix_verified"],
-        })
-
-        log.info(
-            "Sandbox result for %s: reproduced=%s, verified=%s",
-            incident.id,
-            result["reproduced"],
-            result["fix_verified"],
-        )
-        return result
-
-    except Exception as e:
-        log.error("Sandbox execution failed for %s: %s", incident.id, e)
-        await event_bus.publish(incident.id, {
-            "type": "sandbox_error",
-            "message": f"Sandbox error: {str(e)}",
-        })
-        return {
-            "reproduced": False,
-            "fix_verified": False,
-            "output": f"Sandbox error: {str(e)}",
-        }
+    return SandboxResult(
+        stdout=stdout or "",
+        stderr=stderr or "",
+        exit_code=exit_code,
+        label=label,
+    )
