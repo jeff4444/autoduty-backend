@@ -1,0 +1,9 @@
+flask
+flask-cors
+google-generativeai
+anthropic
+openai
+modal
+PyGithub
+python-dotenv
+requests
