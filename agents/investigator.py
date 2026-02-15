@@ -1,94 +1,311 @@
-"""Investigation agent — uses the LLM to diagnose root cause and generate a fix."""
+"""Investigation orchestrator — runs the Pydantic AI agent with streaming.
 
-import requests
-from agents.llm_provider import generate_json
+This module is the bridge between the FastAPI pipeline and the Pydantic AI agent.
+It clones the repo, creates agent dependencies, runs the agent via iter(),
+publishes events to the SSE bus, and collects file edits + diffs.
+"""
+
+import json
+from datetime import datetime, timezone
+
+from pydantic_ai import CallToolsNode, ModelRequestNode, UserPromptNode
+from pydantic_ai.messages import TextPart, ToolCallPart
+from pydantic_graph import End
+
+from agents.agent import investigation_agent
+from agents.repo_context import RepoContext
+from agents.tools import AgentDeps
+from config import Config
+from models.incident import AgentEvent, Incident
+from streaming.event_bus import EventBus
 from utils.logger import get_logger
 
 log = get_logger("investigator")
 
-SYSTEM_PROMPT = """You are an expert Site Reliability Engineer and software debugger.
-You will be given:
-1. An error traceback from a Next.js / TypeScript application
-2. The source code of the file that caused the error
-3. Recent log lines
 
-Your job is to:
-- Identify the exact root cause of the error
-- Write the corrected version of the ENTIRE source file
-- The fixed code must keep ALL imports, ALL exports, and the same structure — only fix the bug
-
-IMPORTANT: Preserve the existing imports and the `withAutoduty` wrapper exactly as-is.
-Only change the lines that have the actual bug.
-
-Respond with ONLY valid JSON (no markdown fencing, no extra text) in this exact schema:
-{
-    "root_cause": "A clear 1-2 sentence explanation of what went wrong",
-    "fix_description": "A clear 1-2 sentence explanation of the fix",
-    "affected_file": "The file path that needs to be changed",
-    "fixed_code": "The COMPLETE corrected source file contents"
-}
-"""
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _fetch_file_from_github(repo_url: str, branch: str, file_path: str) -> str:
-    """Fetch a file's raw content from GitHub (fallback if source_code not provided inline)."""
-    try:
-        raw_url = repo_url.replace("github.com", "raw.githubusercontent.com")
-        url = f"{raw_url}/{branch}/{file_path}"
-        log.info("Fetching source file from GitHub: %s", url)
-        resp = requests.get(url, timeout=15)
-        if resp.status_code == 200:
-            return resp.text
-        log.warning("Could not fetch file (status %s)", resp.status_code)
-    except Exception as e:
-        log.warning("GitHub fetch failed: %s", e)
-    return ""
+async def investigate_incident(
+    incident: Incident,
+    event_bus: EventBus,
+    model: str | None = None,
+    retry_context: str | None = None,
+    repo: RepoContext | None = None,
+) -> RepoContext:
+    """Run the full investigation: clone repo, run agent with streaming, collect diffs.
 
-
-def investigate_incident(incident, provider: str = None):
-    """Run investigation on an incident, populating its root_cause and fixed_code fields.
+    Mutates the incident in place with root_cause, fix_description, file_edits, etc.
 
     Args:
-        incident: An Incident model instance (mutated in place).
-        provider: LLM provider name override.
-    """
-    # Use inline source code if available, otherwise try GitHub
-    source_code = incident.original_code or ""
-    if not source_code:
-        source_code = _fetch_file_from_github(
-            incident.repo_url, incident.branch, incident.source_file
-        )
-        incident.original_code = source_code
+        incident: The incident to investigate.
+        event_bus: The event bus for streaming SSE events.
+        model: Pydantic AI model string override (e.g. "anthropic:claude-sonnet-4-20250514").
+        retry_context: Optional context from a previous failed sandbox run.
+            When provided, the agent receives this as additional info to guide its fix.
+        repo: An existing RepoContext from a previous attempt. If provided, cloning is
+            skipped and the repo is reused (with edit tracking reset).
 
-    user_prompt = f"""## Error Report
+    Returns:
+        The RepoContext used, so the caller can reuse it for retries or clean it up.
+    """
+    model = model or Config.AI_MODEL
+
+    # 1. Clone the repository (or reuse existing clone on retry)
+    if repo is None:
+        await event_bus.publish(incident.id, {
+            "type": "status_change",
+            "status": "cloning",
+            "message": f"Cloning {incident.repo_url} (branch: {incident.branch})...",
+        })
+
+        repo = RepoContext(
+            repo_url=incident.repo_url,
+            branch=incident.branch,
+        )
+
+        try:
+            await repo.clone()
+        except Exception as e:
+            log.error("Failed to clone repo for incident %s: %s", incident.id, e)
+            await event_bus.publish(incident.id, {
+                "type": "error",
+                "message": f"Failed to clone repository: {e}",
+            })
+            raise
+    else:
+        # Retry: reset edit tracking so new diffs are relative to current state
+        repo.reset_edit_tracking()
+
+    await event_bus.publish(incident.id, {
+        "type": "status_change",
+        "status": "investigating",
+        "message": "Repository cloned. Starting investigation..." if retry_context is None
+        else "Retrying investigation with sandbox feedback...",
+    })
+
+    # 2. Build the user prompt with error context
+    user_prompt = _build_prompt(incident, retry_context=retry_context)
+
+    # 3. Set up agent dependencies
+    deps = AgentDeps(
+        repo=repo,
+        event_bus=event_bus,
+        incident_id=incident.id,
+    )
+
+    # 4. Run the agent using iter() to walk through each node
+    try:
+        async with investigation_agent.iter(
+            user_prompt,
+            deps=deps,
+            model=model,
+        ) as agent_run:
+            async for node in agent_run:
+                await _process_node(node, incident, event_bus)
+
+        # 5. Extract results from the completed run
+        result = agent_run.result
+        if result is not None:
+            output = result.output
+            incident.root_cause = output.root_cause
+            incident.fix_description = output.fix_description
+            incident.affected_file = (
+                output.affected_files[0] if output.affected_files else incident.source_file
+            )
+        else:
+            log.warning("Agent run for %s completed without a result", incident.id)
+            incident.root_cause = "Investigation completed but no structured result produced"
+            incident.fix_description = "Check agent events for details"
+
+        # 6. Compute diffs from all file edits
+        incident.file_edits = repo.get_file_edits()
+
+        # For backward compat: if there's a single edit, also populate fixed_code
+        if len(incident.file_edits) == 1:
+            incident.fixed_code = incident.file_edits[0].new_content
+            if not incident.original_code:
+                incident.original_code = incident.file_edits[0].original_content
+
+        await event_bus.publish(incident.id, {
+            "type": "investigation_complete",
+            "root_cause": incident.root_cause,
+            "fix_description": incident.fix_description,
+            "affected_files": [e.file_path for e in incident.file_edits],
+            "num_file_edits": len(incident.file_edits),
+            "diffs": [
+                {"file": edit.file_path, "unified_diff": edit.unified_diff}
+                for edit in incident.file_edits
+            ],
+        })
+
+        log.info(
+            "Investigation complete for %s — root cause: %s, %d file(s) edited",
+            incident.id,
+            incident.root_cause,
+            len(incident.file_edits),
+        )
+
+        return repo
+
+    except Exception as e:
+        log.error("Agent run failed for incident %s: %s", incident.id, e)
+        await event_bus.publish(incident.id, {
+            "type": "error",
+            "message": f"Investigation failed: {e}",
+        })
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Node processing — extract events from each step of the agent graph
+# ---------------------------------------------------------------------------
+
+async def _process_node(node, incident: Incident, event_bus: EventBus) -> None:
+    """Process a single node from the agent iteration and publish events."""
+
+    if isinstance(node, UserPromptNode):
+        # Initial prompt node — nothing interesting to stream
+        return
+
+    if isinstance(node, ModelRequestNode):
+        # The agent is sending a request to the model
+        event = AgentEvent(
+            timestamp=_now(),
+            type="model_request",
+            data={"message": "Sending request to model..."},
+        )
+        incident.agent_events.append(event)
+        await event_bus.publish(incident.id, {
+            "type": "model_request",
+            "message": "Sending request to model...",
+        })
+        return
+
+    if isinstance(node, CallToolsNode):
+        # The model returned a response — extract text and tool calls
+        response = node.model_response
+        for part in response.parts:
+            if isinstance(part, TextPart) and part.content:
+                event = AgentEvent(
+                    timestamp=_now(),
+                    type="agent_thought",
+                    data={"content": part.content},
+                )
+                incident.agent_events.append(event)
+                # Publish flat so the frontend gets {type, content, timestamp}
+                await event_bus.publish(incident.id, {
+                    "type": "agent_thought",
+                    "content": part.content,
+                })
+
+            elif isinstance(part, ToolCallPart):
+                # Log the tool call (the actual tool execution + result is
+                # published by the tool functions themselves via the event bus)
+                args = part.args
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {"raw": args[:200]}
+
+                # Truncate large string values for display
+                display_args = {}
+                if isinstance(args, dict):
+                    for k, v in args.items():
+                        if isinstance(v, str) and len(v) > 120:
+                            display_args[k] = v[:120] + "..."
+                        else:
+                            display_args[k] = v
+                else:
+                    display_args = {"raw": str(args)[:200]}
+
+                event = AgentEvent(
+                    timestamp=_now(),
+                    type="tool_call",
+                    data={
+                        "tool": part.tool_name,
+                        "args": display_args,
+                        "tool_call_id": part.tool_call_id,
+                    },
+                )
+                incident.agent_events.append(event)
+                # Publish as a flat event (matching the shape from tools.py)
+                await event_bus.publish(incident.id, {
+                    "type": "tool_call",
+                    "tool": part.tool_name,
+                    "args": display_args,
+                    "tool_call_id": part.tool_call_id,
+                })
+        return
+
+    if isinstance(node, End):
+        event = AgentEvent(
+            timestamp=_now(),
+            type="agent_complete",
+            data={"message": "Agent finished investigation."},
+        )
+        incident.agent_events.append(event)
+        await event_bus.publish(incident.id, {
+            "type": "agent_complete",
+            "message": "Agent finished investigation.",
+        })
+        return
+
+
+# ---------------------------------------------------------------------------
+# Prompt builder
+# ---------------------------------------------------------------------------
+
+def _build_prompt(incident: Incident, retry_context: str | None = None) -> str:
+    """Build the user prompt from incident context."""
+    logs_section = ""
+    if incident.logs:
+        logs_text = "\n".join(incident.logs[-50:])
+        logs_section = f"""
+### Recent Logs
+```
+{logs_text}
+```
+"""
+
+    source_section = ""
+    if incident.original_code:
+        source_section = f"""
+### Source Code ({incident.source_file})
+```
+{incident.original_code}
+```
+"""
+
+    retry_section = ""
+    if retry_context:
+        retry_section = f"""
+
+## RETRY — Previous Attempt Failed
+
+Your previous fix did NOT pass sandbox verification. Below is the feedback from the \
+sandbox run. Analyze what went wrong, then apply corrected fixes using the tools.
+
+{retry_context}
+"""
+
+    return f"""## Error Report
 
 **Error Type:** {incident.error_type}
 **Source File:** {incident.source_file}
+**Repository:** {incident.repo_url}
+**Branch:** {incident.branch}
 
 ### Traceback
 ```
 {incident.traceback}
 ```
-
-### Recent Logs
-```
-{chr(10).join(incident.logs[-50:])}
-```
-
-### Source Code ({incident.source_file})
-```typescript
-{source_code}
-```
-
-Analyze the error and provide the fix as JSON. The fixed_code MUST be the COMPLETE file with ALL original imports and exports preserved — only fix the buggy lines.
+{logs_section}
+{source_section}
+{retry_section}
+Investigate this error. Start by reading the source file mentioned in the traceback, \
+then explore related files as needed. Diagnose the root cause and apply fixes using \
+the available tools. You may edit multiple files if the fix requires it.
 """
-
-    log.info("Sending investigation prompt to %s (source code length: %d chars)", provider or "default", len(source_code))
-    result = generate_json(SYSTEM_PROMPT, user_prompt, provider=provider)
-
-    incident.root_cause = result.get("root_cause", "Unknown")
-    incident.fix_description = result.get("fix_description", "No description")
-    incident.affected_file = result.get("affected_file", incident.source_file)
-    incident.fixed_code = result.get("fixed_code", "")
-
-    log.info("Investigation complete — root cause: %s", incident.root_cause)

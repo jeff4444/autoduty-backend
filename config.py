@@ -5,10 +5,10 @@ load_dotenv()
 
 
 class Config:
-    # LLM Provider
-    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")  # gemini | anthropic | openai
+    # Pydantic AI model string — e.g. "anthropic:claude-sonnet-4-20250514", "openai:gpt-4o", "google-gla:gemini-2.0-flash"
+    AI_MODEL = os.getenv("AI_MODEL", "anthropic:claude-sonnet-4-20250514")
 
-    # API Keys
+    # API Keys (Pydantic AI reads these from env automatically, but we keep them for reference)
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -18,5 +18,11 @@ class Config:
     GITHUB_REPO = os.getenv("GITHUB_REPO", "")
 
     # Server
-    FLASK_PORT = int(os.getenv("FLASK_PORT", "5001"))
-    FLASK_DEBUG = os.getenv("FLASK_DEBUG", "true").lower() == "true"
+    PORT = int(os.getenv("PORT", "5001"))
+    DEBUG = os.getenv("DEBUG", "true").lower() == "true"
+
+    # Repo cloning
+    CLONE_BASE_DIR = os.getenv("CLONE_BASE_DIR", "/tmp/autoduty-repos")
+
+    # Pipeline retry settings
+    MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))

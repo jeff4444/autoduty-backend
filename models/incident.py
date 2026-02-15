@@ -1,92 +1,104 @@
-"""In-memory incident store and data model."""
+"""Incident data model and in-memory store — Pydantic BaseModel edition."""
 
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any
+
+from pydantic import BaseModel, Field
 
 
-class Incident:
+# ---------------------------------------------------------------------------
+# Sub-models
+# ---------------------------------------------------------------------------
+class FileEdit(BaseModel):
+    """A single file edit made by the agent."""
+
+    file_path: str
+    original_content: str = ""
+    new_content: str = ""
+    unified_diff: str = ""  # git-style unified diff
+
+
+class TerminalLogEntry(BaseModel):
+    """One line of sandbox terminal output."""
+
+    timestamp: str  # ISO-8601
+    stream: str  # "stdout" | "stderr"
+    data: str
+    label: str = ""  # e.g. "original-buggy" or "fixed"
+
+
+class AgentEvent(BaseModel):
+    """A single event from the agent run (for replay / audit)."""
+
+    timestamp: str
+    type: str  # "thought", "tool_call", "tool_result", "status_change", "error"
+    data: dict[str, Any] = {}
+
+
+# ---------------------------------------------------------------------------
+# Incident model
+# ---------------------------------------------------------------------------
+class Incident(BaseModel):
     """Represents a single incident through its lifecycle."""
 
-    STATUSES = [
-        "detected",
-        "investigating",
-        "fix_proposed",
-        "simulating",
-        "verified",
-        "failed",
-        "pr_created",
-        "resolved",
-    ]
+    model_config = {"arbitrary_types_allowed": True}
 
-    def __init__(
-        self,
-        error_type: str,
-        traceback: str,
-        logs: list[str],
-        source_file: str,
-        repo_url: str,
-        branch: str = "main",
-        source_code: str = "",
-    ):
-        self.id = str(uuid.uuid4())[:8]
-        self.error_type = error_type
-        self.traceback = traceback
-        self.logs = logs
-        self.source_file = source_file
-        self.repo_url = repo_url
-        self.branch = branch
-        self.status = "detected"
-        self.created_at = datetime.now(timezone.utc).isoformat()
-        self.updated_at = self.created_at
+    STATUSES: list[str] = Field(
+        default=[
+            "detected",
+            "investigating",
+            "fix_proposed",
+            "simulating",
+            "verified",
+            "failed",
+            "pr_created",
+            "resolved",
+        ],
+        exclude=True,
+    )
 
-        # Source code sent inline from the monitored app
-        self.original_code: Optional[str] = source_code or None
+    id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
+    error_type: str
+    traceback: str
+    logs: list[str] = []
+    source_file: str
+    repo_url: str
+    branch: str = "main"
+    status: str = "detected"
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
-        # Populated by the investigation agent
-        self.root_cause: Optional[str] = None
-        self.fix_description: Optional[str] = None
-        self.fixed_code: Optional[str] = None
-        self.affected_file: Optional[str] = None
+    # Source code sent inline from the monitored app (kept for backward compat)
+    original_code: Optional[str] = None
 
-        # Populated by the sandbox
-        self.sandbox_reproduced: Optional[bool] = None
-        self.sandbox_fix_verified: Optional[bool] = None
-        self.sandbox_output: Optional[str] = None
+    # Agent results
+    root_cause: Optional[str] = None
+    fix_description: Optional[str] = None
+    affected_file: Optional[str] = None
+    file_edits: list[FileEdit] = []
 
-        # Populated by GitHub integration
-        self.pr_url: Optional[str] = None
-        self.pr_branch: Optional[str] = None
+    # Legacy single-file fields (populated for backward compat from file_edits)
+    fixed_code: Optional[str] = None
 
-    def update_status(self, new_status: str):
+    # Sandbox
+    sandbox_reproduced: Optional[bool] = None
+    sandbox_fix_verified: Optional[bool] = None
+    sandbox_output: Optional[str] = None
+    sandbox_terminal_log: list[TerminalLogEntry] = []
+
+    # Agent activity log (for replay)
+    agent_events: list[AgentEvent] = []
+
+    # GitHub PR
+    pr_url: Optional[str] = None
+    pr_branch: Optional[str] = None
+
+    def update_status(self, new_status: str) -> None:
         if new_status not in self.STATUSES:
             raise ValueError(f"Invalid status: {new_status}")
         self.status = new_status
         self.updated_at = datetime.now(timezone.utc).isoformat()
-
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "error_type": self.error_type,
-            "traceback": self.traceback,
-            "logs": self.logs,
-            "source_file": self.source_file,
-            "repo_url": self.repo_url,
-            "branch": self.branch,
-            "status": self.status,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "root_cause": self.root_cause,
-            "fix_description": self.fix_description,
-            "original_code": self.original_code,
-            "fixed_code": self.fixed_code,
-            "affected_file": self.affected_file,
-            "sandbox_reproduced": self.sandbox_reproduced,
-            "sandbox_fix_verified": self.sandbox_fix_verified,
-            "sandbox_output": self.sandbox_output,
-            "pr_url": self.pr_url,
-            "pr_branch": self.pr_branch,
-        }
 
     def to_summary(self) -> dict:
         return {
@@ -100,13 +112,16 @@ class Incident:
         }
 
 
+# ---------------------------------------------------------------------------
+# In-memory store
+# ---------------------------------------------------------------------------
 class IncidentStore:
-    """In-memory incident storage for hackathon. Swap for DB later."""
+    """In-memory incident storage. Swap for a DB later."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._incidents: dict[str, Incident] = {}
 
-    def create(self, **kwargs) -> Incident:
+    def create(self, **kwargs: Any) -> Incident:
         incident = Incident(**kwargs)
         self._incidents[incident.id] = incident
         return incident

@@ -1,5 +1,8 @@
-flask
-flask-cors
+fastapi
+uvicorn[standard]
+sse-starlette
+pydantic-ai
+gitpython
 google-generativeai
 anthropic
 openai
